@@ -1,5 +1,9 @@
--- ESP + Hitbox com Menu (CoreGui) - nome "lxzinn__", toggle K para mostrar/ocultar
--- Copie somente o conteúdo deste bloco (não copie as linhas de código-fence do Markdown)
+-- ESP + Hitbox com Menu (CoreGui) - Versão completa e funcional
+-- Nome do menu: "lxzinn__"
+-- Toggle K para mostrar/ocultar o menu
+-- Inclui: ESP (billboards), Hitbox (invisível com clone), toggles ON/OFF funcionando corretamente,
+-- otimizações para reduzir queda de FPS (event-driven + taxas configuráveis).
+-- Copie apenas o conteúdo deste arquivo para o executor (não inclua as crases do Markdown).
 
 -- =========================
 -- Configurações iniciais
@@ -8,7 +12,7 @@ getgenv().ESPSettings = getgenv().ESPSettings or {
     Enabled = true,
     ShowLocal = false,
     MaxDistance = 2000,
-    UpdateRate = 0, -- 0 = RenderStepped
+    UpdateRate = 0.12, -- segundos entre updates do ESP (0 = RenderStepped)
     ShowNPCs = true,
     KeybindToggle = Enum.KeyCode.RightControl,
     BillboardName = "ESP_Billboard_v1",
@@ -18,7 +22,7 @@ getgenv().ESPSettings = getgenv().ESPSettings or {
 getgenv().HitboxSettings = getgenv().HitboxSettings or {
     Enabled = true,
     hitboxSize = 10,
-    updateRate = 0.1,
+    updateRate = 0.2, -- segundos entre updates do hitbox
     HitboxPartName = "ESP_Hitbox_Part",
     OriginalHeadName = "OriginalHead",
 }
@@ -33,9 +37,15 @@ local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 
--- Nome do menu (conforme pedido)
+-- Nome do menu
 local MENU_NAME = "lxzinn__"
-local menuScreen -- referência para o ScreenGui
+local menuScreen
+local ui_espBtn, ui_hitBtn, ui_sizeBox -- referências UI
+
+-- Estruturas gerenciadas
+local playerEntries = {} -- player -> { character = Instance, head = Part, billboard = BillboardGui }
+local npcEntries = {}    -- model -> { character = Instance, head = Part, billboard = BillboardGui }
+local modifiedCharacters = {} -- character -> { hitboxPart, headClone, originalHeadProps }
 
 -- UTIL
 local function shortenName(name, maxLen)
@@ -48,7 +58,7 @@ local function shortenName(name, maxLen)
 end
 
 -- =========================
--- ESP
+-- BILLBOARD (ESP)
 -- =========================
 local function createBillboardForHead(head)
     if not head or not head:IsA("BasePart") then return nil end
@@ -83,122 +93,168 @@ local function createBillboardForHead(head)
     return billboard
 end
 
-local function cleanupOrphanBillboards()
-    for _, part in ipairs(workspace:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local bb = part:FindFirstChild(ESP.BillboardName)
+local function setAllBillboardsEnabled(state)
+    -- varredura única pelo workspace para garantir que billboards órfãos também sejam afetados
+    -- essa função é chamada apenas quando o usuário togglea ESP
+    for _, gui in ipairs(workspace:GetDescendants()) do
+        if gui and gui:IsA("BillboardGui") and gui.Name == ESP.BillboardName then
+            -- Ajusta Enabled diretamente
+            gui.Enabled = state
+        end
+    end
+end
+
+local function setupPlayerEntry(player)
+    if not player then return end
+    local char = player.Character
+    if not char then return end
+    local head = char:FindFirstChild("Head") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+    if not head or not head:IsA("BasePart") then return end
+
+    local bb = createBillboardForHead(head)
+    playerEntries[player] = { character = char, head = head, billboard = bb }
+    if bb then bb.Enabled = ESP.Enabled end
+end
+
+local function setupNPCEntry(model)
+    if not model or not model:IsA("Model") then return end
+    if Players:GetPlayerFromCharacter(model) then return end
+    if not model:FindFirstChildOfClass("Humanoid") then return end
+    local head = model:FindFirstChild("Head") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
+    if not head or not head:IsA("BasePart") then return end
+    local bb = createBillboardForHead(head)
+    npcEntries[model] = { character = model, head = head, billboard = bb }
+    if bb then bb.Enabled = ESP.Enabled end
+
+    model.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            local entry = npcEntries[model]
+            if entry and entry.head and entry.head.Parent then
+                local bb2 = entry.head:FindFirstChild(ESP.BillboardName)
+                if bb2 and bb2.Parent then bb2:Destroy() end
+            end
+            npcEntries[model] = nil
+        end
+    end)
+end
+
+local function cleanupPlayerEntry(player)
+    local entry = playerEntries[player]
+    if not entry then return end
+    if entry.head and entry.head.Parent then
+        local bb = entry.head:FindFirstChild(ESP.BillboardName)
+        if bb and bb.Parent then bb:Destroy() end
+    end
+    -- remover hitbox se existir
+    if entry.character and modifiedCharacters[entry.character] then
+        local data = modifiedCharacters[entry.character]
+        if data and data.hitboxPart and data.hitboxPart.Parent then data.hitboxPart:Destroy() end
+        local head = entry.character:FindFirstChild("Head")
+        if head and data and data.originalHeadProps then
+            head.Size = data.originalHeadProps.Size or head.Size
+            head.Transparency = data.originalHeadProps.Transparency or 0
+            head.CanCollide = data.originalHeadProps.CanCollide or false
+            head.Anchored = data.originalHeadProps.Anchored or false
+            head.Massless = data.originalHeadProps.Massless or false
+        end
+        modifiedCharacters[entry.character] = nil
+    end
+    playerEntries[player] = nil
+end
+
+-- =========================
+-- ESP Update (leve) ligado ao Heartbeat e respeitando UpdateRate
+-- =========================
+local espAccumulator = 0
+local function espUpdate(dt)
+    espAccumulator = espAccumulator + dt
+    if ESP.UpdateRate > 0 and espAccumulator < ESP.UpdateRate then return end
+    espAccumulator = 0
+
+    local myPos
+    if LocalPlayer and LocalPlayer.Character and LocalPlayer.Character.PrimaryPart then
+        myPos = LocalPlayer.Character.PrimaryPart.Position
+    end
+
+    -- players
+    for pl, entry in pairs(playerEntries) do
+        if entry and entry.head and entry.head.Parent then
+            local bb = entry.head:FindFirstChild(ESP.BillboardName)
             if bb and bb:IsA("BillboardGui") then
-                local parentModel = part.Parent
-                local ok = false
-                if parentModel and parentModel:IsA("Model") then
-                    if parentModel:FindFirstChildOfClass("Humanoid") then
-                        ok = true
-                    end
-                end
-                if not ok then
-                    bb:Destroy()
-                end
-            end
-        end
-    end
-end
-
-local function collectTargets()
-    local targets = {}
-
-    for _, pl in ipairs(Players:GetPlayers()) do
-        if pl ~= LocalPlayer or ESP.ShowLocal then
-            local char = pl.Character
-            if char and char.Parent then
-                local head = char:FindFirstChild("Head") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
-                if head and head:IsA("BasePart") then
-                    table.insert(targets, {type = "player", player = pl, model = char, head = head})
-                end
-            end
-        end
-    end
-
-    if ESP.ShowNPCs then
-        for _, model in ipairs(workspace:GetChildren()) do
-            if model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
-                if model:FindFirstChildOfClass("Humanoid") then
-                    local head = model:FindFirstChild("Head") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
-                    if head and head:IsA("BasePart") then
-                        table.insert(targets, {type = "npc", model = model, head = head})
+                local label = bb:FindFirstChild("Label")
+                if label then
+                    if pl ~= LocalPlayer or ESP.ShowLocal then
+                        label.Text = shortenName(pl.Name, ESP.MaxNameLength)
+                        if myPos and ESP.MaxDistance and ESP.MaxDistance > 0 then
+                            local dist = (entry.head.Position - myPos).Magnitude
+                            bb.Enabled = ESP.Enabled and dist <= ESP.MaxDistance
+                        else
+                            bb.Enabled = ESP.Enabled
+                        end
+                    else
+                        bb.Enabled = false
                     end
                 end
             end
+        else
+            playerEntries[pl] = nil
         end
     end
 
-    return targets
-end
-
-local function updateBillboard(target)
-    if not target or not target.head or not target.head.Parent then return end
-    local head = target.head
-    local billboard = createBillboardForHead(head)
-    if not billboard then return end
-    local label = billboard:FindFirstChild("Label")
-    if not label then return end
-
-    local pos = head.Position
-    local txtParts = {}
-
-    if target.type == "player" and target.player then
-        table.insert(txtParts, shortenName(target.player.Name, ESP.MaxNameLength))
-    elseif target.type == "npc" and target.model then
-        table.insert(txtParts, shortenName(target.model.Name, ESP.MaxNameLength))
-    else
-        table.insert(txtParts, "Model")
-    end
-
-    if LocalPlayer and LocalPlayer.Character and LocalPlayer.Character.PrimaryPart and ESP.MaxDistance and ESP.MaxDistance > 0 then
-        local myPos = LocalPlayer.Character.PrimaryPart.Position
-        local dist = (pos - myPos).Magnitude
-        if ESP.MaxDistance and dist > ESP.MaxDistance then
-            billboard.Enabled = false
-            return
+    -- npcs
+    for model, entry in pairs(npcEntries) do
+        if entry and entry.head and entry.head.Parent then
+            local bb = entry.head:FindFirstChild(ESP.BillboardName)
+            if bb and bb:IsA("BillboardGui") then
+                local label = bb:FindFirstChild("Label")
+                if label then
+                    label.Text = shortenName(model.Name, ESP.MaxNameLength)
+                    if myPos and ESP.MaxDistance and ESP.MaxDistance > 0 then
+                        local dist = (entry.head.Position - myPos).Magnitude
+                        bb.Enabled = ESP.Enabled and dist <= ESP.MaxDistance
+                    else
+                        bb.Enabled = ESP.Enabled
+                    end
+                end
+            end
+        else
+            npcEntries[model] = nil
         end
     end
-
-    billboard.Enabled = ESP.Enabled
-    label.Text = table.concat(txtParts, "  |  ")
 end
 
-local function updateAllESP()
-    cleanupOrphanBillboards()
-    local targets = collectTargets()
-    for _, t in ipairs(targets) do
-        pcall(updateBillboard, t)
+RunService.Heartbeat:Connect(function(dt)
+    -- sempre checamos espUpdate para manter billboards sincronizados quando ESP.Enabled está true
+    pcall(function()
+        if ESP.Enabled then espUpdate(dt) end
+    end)
+end)
+
+-- Cleanup periódico leve (evita GetDescendants por frame)
+task.spawn(function()
+    while task.wait(10) do
+        for pl, entry in pairs(playerEntries) do
+            if not entry or not entry.head or not entry.head.Parent then playerEntries[pl] = nil end
+        end
+        for model, entry in pairs(npcEntries) do
+            if not entry or not entry.head or not entry.head.Parent then npcEntries[model] = nil end
+        end
     end
-end
+end)
 
 -- =========================
--- HITBOX (fix)
+-- HITBOX (idempotente)
 -- =========================
-local modifiedCharacters = {} -- character -> { hitboxPart = Instance, headClone = Instance, originalHeadProps = {} }
-
-local function isAlreadyModified(character)
-    if not character then return false end
-    for _, v in ipairs(character:GetDescendants()) do
-        if v:IsA("BasePart") and v.Name == HB.HitboxPartName then
-            return true
-        end
-    end
-    return false
-end
-
-local function transformHead(character)
+local function ensureHitbox(character)
     if not character or not character.Parent then return end
     local head = character:FindFirstChild("Head")
     if not head or not head:IsA("BasePart") then return end
-    if isAlreadyModified(character) then
-        for _, v in ipairs(character:GetDescendants()) do
-            if v:IsA("BasePart") and v.Name == HB.HitboxPartName then
-                v.Size = Vector3.new(HB.hitboxSize, HB.hitboxSize, HB.hitboxSize)
-                v.CFrame = head.CFrame
-            end
+
+    if modifiedCharacters[character] then
+        local data = modifiedCharacters[character]
+        if data.hitboxPart and data.hitboxPart.Parent then
+            data.hitboxPart.Size = Vector3.new(HB.hitboxSize, HB.hitboxSize, HB.hitboxSize)
+            data.hitboxPart.CFrame = head.CFrame
         end
         return
     end
@@ -222,12 +278,9 @@ local function transformHead(character)
     local headClone = head:Clone()
     headClone.Name = HB.OriginalHeadName
     for _, child in ipairs(headClone:GetDescendants()) do
-        if child:IsA("Motor6D") or child:IsA("Weld") then
-            child:Destroy()
-        end
+        if child:IsA("Motor6D") or child:IsA("Weld") then child:Destroy() end
     end
     headClone.Parent = hitboxPart
-    headClone.CFrame = head.CFrame
 
     local weldClone = Instance.new("WeldConstraint")
     weldClone.Part0 = headClone
@@ -253,12 +306,10 @@ local function transformHead(character)
     }
 end
 
-local function restoreHead(character)
+local function removeHitbox(character)
     if not character or not modifiedCharacters[character] then return end
     local data = modifiedCharacters[character]
-    if data.hitboxPart and data.hitboxPart.Parent then
-        data.hitboxPart:Destroy()
-    end
+    if data.hitboxPart and data.hitboxPart.Parent then data.hitboxPart:Destroy() end
     local head = character:FindFirstChild("Head")
     if head and data.originalHeadProps then
         head.Size = data.originalHeadProps.Size or head.Size
@@ -270,102 +321,164 @@ local function restoreHead(character)
     modifiedCharacters[character] = nil
 end
 
-local function updateAllHitboxes()
-    for _, player in pairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Character then
-            local char = player.Character
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum then
-                if hum.Sit then
-                    restoreHead(char)
-                else
-                    if HB.Enabled then
-                        pcall(transformHead, char)
-                        local data = modifiedCharacters[char]
-                        if data and data.hitboxPart and data.hitboxPart:IsA("BasePart") then
-                            data.hitboxPart.Size = Vector3.new(HB.hitboxSize, HB.hitboxSize, HB.hitboxSize)
-                        end
-                        if data and data.hitboxPart and data.hitboxPart:IsA("BasePart") then
-                            local head = char:FindFirstChild("Head")
-                            if head then
-                                data.hitboxPart.CFrame = head.CFrame
-                            end
-                        end
-                    else
-                        restoreHead(char)
-                    end
-                end
-            end
-        end
-    end
-end
-
--- =========================
--- Eventos e loops
--- =========================
-Players.PlayerAdded:Connect(function(player)
-    player.CharacterAdded:Connect(function(char)
-        task.wait(1)
-        if HB.Enabled then
-            pcall(transformHead, char)
-        end
-        if ESP.Enabled then
-            pcall(updateAllESP)
-        end
-    end)
-    player.CharacterRemoving:Connect(function(char)
-        modifiedCharacters[char] = nil
-    end)
-end)
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    if input.KeyCode == ESP.KeybindToggle then
-        ESP.Enabled = not ESP.Enabled
-        getgenv().ESPSettings.Enabled = ESP.Enabled
-        updateAllESP()
-    end
-end)
-
-if ESP.UpdateRate and ESP.UpdateRate > 0 then
-    spawn(function()
-        while true do
-            if ESP.Enabled then updateAllESP() end
-            wait(ESP.UpdateRate)
-        end
-    end)
-else
-    RunService.RenderStepped:Connect(function()
-        if ESP.Enabled then
-            pcall(updateAllESP)
-        end
-    end)
-end
-
+-- Hitbox update loop (controlado por HB.updateRate)
 task.spawn(function()
     while task.wait(HB.updateRate) do
         if HB.Enabled then
-            pcall(updateAllHitboxes)
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and player.Character and player.Character.Parent then
+                    local char = player.Character
+                    local hum = char:FindFirstChildOfClass("Humanoid")
+                    if hum and not hum.Sit then
+                        pcall(ensureHitbox, char)
+                    else
+                        pcall(removeHitbox, char)
+                    end
+                end
+            end
         else
+            -- se desativado, remove todos
             for char, _ in pairs(modifiedCharacters) do
-                pcall(restoreHead, char)
+                pcall(removeHitbox, char)
             end
         end
     end
 end)
 
--- Inicialização
-task.spawn(function()
-    task.wait(1)
-    updateAllESP()
-    updateAllHitboxes()
+-- =========================
+-- Eventos para players & NPCs
+-- =========================
+for _, pl in ipairs(Players:GetPlayers()) do
+    pl.CharacterAdded:Connect(function(char)
+        task.wait(0.7)
+        setupPlayerEntry(pl)
+        if HB.Enabled and char then pcall(ensureHitbox, char) end
+    end)
+    pl.CharacterRemoving:Connect(function()
+        cleanupPlayerEntry(pl)
+    end)
+    if pl.Character then
+        task.spawn(function()
+            task.wait(0.7)
+            setupPlayerEntry(pl)
+            if HB.Enabled and pl.Character then pcall(ensureHitbox, pl.Character) end
+        end)
+    end
+end
+
+Players.PlayerAdded:Connect(function(pl)
+    pl.CharacterAdded:Connect(function(char)
+        task.wait(0.7)
+        setupPlayerEntry(pl)
+        if HB.Enabled and char then pcall(ensureHitbox, char) end
+    end)
+    pl.CharacterRemoving:Connect(function(char)
+        cleanupPlayerEntry(pl)
+    end)
 end)
 
+if ESP.ShowNPCs then
+    for _, child in ipairs(workspace:GetChildren()) do
+        if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(child) then
+            setupNPCEntry(child)
+        end
+    end
+    workspace.ChildAdded:Connect(function(child)
+        task.defer(function()
+            if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(child) then
+                setupNPCEntry(child)
+            end
+        end)
+    end)
+end
+
 -- =========================
--- MENU (CoreGui) - nome "lxzinn__" e toggle por K
+-- Toggles do ESP (corrigidos) e Hitbox
+-- =========================
+local function enableESP()
+    ESP.Enabled = true
+    getgenv().ESPSettings.Enabled = true
+
+    -- ativa billboards gerenciadas
+    for pl, entry in pairs(playerEntries) do
+        if entry and entry.head then
+            local bb = entry.head:FindFirstChild(ESP.BillboardName) or createBillboardForHead(entry.head)
+            if bb then bb.Enabled = true end
+        end
+    end
+    for model, entry in pairs(npcEntries) do
+        if entry and entry.head then
+            local bb = entry.head:FindFirstChild(ESP.BillboardName) or createBillboardForHead(entry.head)
+            if bb then bb.Enabled = true end
+        end
+    end
+
+    -- ativa também quaisquer billboards órfãos no workspace
+    setAllBillboardsEnabled(true)
+end
+
+local function disableESP()
+    ESP.Enabled = false
+    getgenv().ESPSettings.Enabled = false
+
+    -- desativa billboards gerenciadas
+    for pl, entry in pairs(playerEntries) do
+        if entry and entry.head then
+            local bb = entry.head:FindFirstChild(ESP.BillboardName)
+            if bb and bb:IsA("BillboardGui") then bb.Enabled = false end
+        end
+    end
+    for model, entry in pairs(npcEntries) do
+        if entry and entry.head then
+            local bb = entry.head:FindFirstChild(ESP.BillboardName)
+            if bb and bb:IsA("BillboardGui") then bb.Enabled = false end
+        end
+    end
+
+    -- desativa quaisquer billboards órfãos no workspace também
+    setAllBillboardsEnabled(false)
+end
+
+local function toggleESP()
+    if ESP.Enabled then
+        disableESP()
+    else
+        enableESP()
+    end
+    if ui_espBtn and ui_espBtn.Parent then ui_espBtn.Text = (ESP.Enabled and "ESP: ON" or "ESP: OFF") end
+end
+
+local function enableHB()
+    HB.Enabled = true
+    getgenv().HitboxSettings.Enabled = true
+    for _, entry in pairs(playerEntries) do
+        if entry and entry.character then pcall(ensureHitbox, entry.character) end
+    end
+    for _, entry in pairs(npcEntries) do
+        if entry and entry.character then pcall(ensureHitbox, entry.character) end
+    end
+end
+
+local function disableHB()
+    HB.Enabled = false
+    getgenv().HitboxSettings.Enabled = false
+    for _, entry in pairs(playerEntries) do
+        if entry and entry.character then pcall(removeHitbox, entry.character) end
+    end
+    for _, entry in pairs(npcEntries) do
+        if entry and entry.character then pcall(removeHitbox, entry.character) end
+    end
+end
+
+local function toggleHB()
+    if HB.Enabled then disableHB() else enableHB() end
+    if ui_hitBtn and ui_hitBtn.Parent then ui_hitBtn.Text = (HB.Enabled and "Hitbox: ON" or "Hitbox: OFF") end
+end
+
+-- =========================
+-- MENU (CoreGui) - cria e guarda referências de botões
 -- =========================
 local function createMenu()
-    -- Remove menu antigo com mesmo nome (se existir)
     local existing = CoreGui:FindFirstChild(MENU_NAME)
     if existing then existing:Destroy() end
 
@@ -373,13 +486,14 @@ local function createMenu()
     screen.Name = MENU_NAME
     screen.ResetOnSpawn = false
     screen.Enabled = true
+    -- tenta CoreGui; se falhar (executor), cairá no pcall de ensureMenu
     screen.Parent = CoreGui
     menuScreen = screen
 
     local frame = Instance.new("Frame")
     frame.Name = "Main"
-    frame.Size = UDim2.new(0, 280, 0, 160)
-    frame.Position = UDim2.new(0.5, -140, 0.2, 0)
+    frame.Size = UDim2.new(0, 300, 0, 160)
+    frame.Position = UDim2.new(0.5, -150, 0.2, 0)
     frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
     frame.BorderSizePixel = 0
     frame.Parent = screen
@@ -401,29 +515,29 @@ local function createMenu()
     title.TextColor3 = Color3.fromRGB(255, 255, 255)
     title.Parent = frame
 
-    local espBtn = Instance.new("TextButton")
-    espBtn.Name = "ESPButton"
-    espBtn.Size = UDim2.new(0, 120, 0, 36)
-    espBtn.Position = UDim2.new(0, 12, 0, 36)
-    espBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    espBtn.BorderSizePixel = 0
-    espBtn.Font = Enum.Font.Gotham
-    espBtn.TextSize = 14
-    espBtn.TextColor3 = Color3.fromRGB(255,255,255)
-    espBtn.Text = (ESP.Enabled and "ESP: ON" or "ESP: OFF")
-    espBtn.Parent = frame
+    ui_espBtn = Instance.new("TextButton")
+    ui_espBtn.Name = "ESPButton"
+    ui_espBtn.Size = UDim2.new(0, 140, 0, 36)
+    ui_espBtn.Position = UDim2.new(0, 10, 0, 36)
+    ui_espBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    ui_espBtn.BorderSizePixel = 0
+    ui_espBtn.Font = Enum.Font.Gotham
+    ui_espBtn.TextSize = 14
+    ui_espBtn.TextColor3 = Color3.fromRGB(255,255,255)
+    ui_espBtn.Text = (ESP.Enabled and "ESP: ON" or "ESP: OFF")
+    ui_espBtn.Parent = frame
 
-    local hitBtn = Instance.new("TextButton")
-    hitBtn.Name = "HitboxButton"
-    hitBtn.Size = UDim2.new(0, 120, 0, 36)
-    hitBtn.Position = UDim2.new(0, 148, 0, 36)
-    hitBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    hitBtn.BorderSizePixel = 0
-    hitBtn.Font = Enum.Font.Gotham
-    hitBtn.TextSize = 14
-    hitBtn.TextColor3 = Color3.fromRGB(255,255,255)
-    hitBtn.Text = (HB.Enabled and "Hitbox: ON" or "Hitbox: OFF")
-    hitBtn.Parent = frame
+    ui_hitBtn = Instance.new("TextButton")
+    ui_hitBtn.Name = "HitboxButton"
+    ui_hitBtn.Size = UDim2.new(0, 140, 0, 36)
+    ui_hitBtn.Position = UDim2.new(0, 150, 0, 36)
+    ui_hitBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    ui_hitBtn.BorderSizePixel = 0
+    ui_hitBtn.Font = Enum.Font.Gotham
+    ui_hitBtn.TextSize = 14
+    ui_hitBtn.TextColor3 = Color3.fromRGB(255,255,255)
+    ui_hitBtn.Text = (HB.Enabled and "Hitbox: ON" or "Hitbox: OFF")
+    ui_hitBtn.Parent = frame
 
     local sizeLabel = Instance.new("TextLabel")
     sizeLabel.Name = "SizeLabel"
@@ -437,18 +551,18 @@ local function createMenu()
     sizeLabel.TextXAlignment = Enum.TextXAlignment.Left
     sizeLabel.Parent = frame
 
-    local sizeBox = Instance.new("TextBox")
-    sizeBox.Name = "SizeBox"
-    sizeBox.Size = UDim2.new(0, 120, 0, 28)
-    sizeBox.Position = UDim2.new(0, 100, 0, 80)
-    sizeBox.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-    sizeBox.BorderSizePixel = 0
-    sizeBox.Font = Enum.Font.Gotham
-    sizeBox.TextSize = 14
-    sizeBox.TextColor3 = Color3.fromRGB(255,255,255)
-    sizeBox.Text = tostring(HB.hitboxSize)
-    sizeBox.ClearTextOnFocus = false
-    sizeBox.Parent = frame
+    ui_sizeBox = Instance.new("TextBox")
+    ui_sizeBox.Name = "SizeBox"
+    ui_sizeBox.Size = UDim2.new(0, 120, 0, 28)
+    ui_sizeBox.Position = UDim2.new(0, 100, 0, 80)
+    ui_sizeBox.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    ui_sizeBox.BorderSizePixel = 0
+    ui_sizeBox.Font = Enum.Font.Gotham
+    ui_sizeBox.TextSize = 14
+    ui_sizeBox.TextColor3 = Color3.fromRGB(255,255,255)
+    ui_sizeBox.Text = tostring(HB.hitboxSize)
+    ui_sizeBox.ClearTextOnFocus = false
+    ui_sizeBox.Parent = frame
 
     local applyBtn = Instance.new("TextButton")
     applyBtn.Name = "ApplyButton"
@@ -474,64 +588,43 @@ local function createMenu()
     closeBtn.Text = "Fechar"
     closeBtn.Parent = frame
 
-    espBtn.MouseButton1Click:Connect(function()
-        ESP.Enabled = not ESP.Enabled
-        getgenv().ESPSettings.Enabled = ESP.Enabled
-        espBtn.Text = (ESP.Enabled and "ESP: ON" or "ESP: OFF")
-        updateAllESP()
-    end)
-
-    hitBtn.MouseButton1Click:Connect(function()
-        HB.Enabled = not HB.Enabled
-        getgenv().HitboxSettings.Enabled = HB.Enabled
-        hitBtn.Text = (HB.Enabled and "Hitbox: ON" or "Hitbox: OFF")
-        if not HB.Enabled then
-            for char, _ in pairs(modifiedCharacters) do
-                pcall(restoreHead, char)
-            end
-        else
-            for _, pl in pairs(Players:GetPlayers()) do
-                if pl ~= LocalPlayer and pl.Character then
-                    pcall(transformHead, pl.Character)
-                end
-            end
-        end
-    end)
+    ui_espBtn.MouseButton1Click:Connect(function() toggleESP() end)
+    ui_hitBtn.MouseButton1Click:Connect(function() toggleHB() end)
 
     applyBtn.MouseButton1Click:Connect(function()
-        local text = sizeBox.Text
+        local text = ui_sizeBox.Text
         local num = tonumber(text)
         if num and num > 0 then
             HB.hitboxSize = num
             getgenv().HitboxSettings.hitboxSize = num
-            for char, data in pairs(modifiedCharacters) do
-                if data and data.hitboxPart and data.hitboxPart:IsA("BasePart") then
-                    data.hitboxPart.Size = Vector3.new(num, num, num)
+            -- aplica tamanho nas hitboxes existentes
+            for _, entry in pairs(playerEntries) do
+                if entry and entry.character then
+                    local hit = entry.character:FindFirstChild(HB.HitboxPartName)
+                    if hit and hit:IsA("BasePart") then hit.Size = Vector3.new(num, num, num) end
+                end
+            end
+            for _, entry in pairs(npcEntries) do
+                if entry and entry.character then
+                    local hit = entry.character:FindFirstChild(HB.HitboxPartName)
+                    if hit and hit:IsA("BasePart") then hit.Size = Vector3.new(num, num, num) end
                 end
             end
         else
-            sizeBox.Text = tostring(HB.hitboxSize)
+            ui_sizeBox.Text = tostring(HB.hitboxSize)
         end
     end)
 
-    -- fechar apenas esconde o menu (Enabled = false)
     closeBtn.MouseButton1Click:Connect(function()
-        if menuScreen and menuScreen.Parent then
-            menuScreen.Enabled = false
-        end
+        if menuScreen and menuScreen.Parent then menuScreen.Enabled = false end
     end)
 
     return screen
 end
 
--- Cria menu inicialmente (tenta em CoreGui)
 local function ensureMenu()
-    if menuScreen and menuScreen.Parent and menuScreen.Enabled ~= nil then
-        return menuScreen
-    end
-    local ok, err = pcall(function()
-        createMenu()
-    end)
+    if menuScreen and menuScreen.Parent and menuScreen.Enabled ~= nil then return menuScreen end
+    local ok, err = pcall(function() createMenu() end)
     if not ok then
         warn("[ESP+HITBOX] Não foi possível criar menu em CoreGui:", err)
         -- fallback em PlayerGui
@@ -540,28 +633,56 @@ local function ensureMenu()
         fallback.ResetOnSpawn = false
         fallback.Parent = LocalPlayer:WaitForChild("PlayerGui")
         menuScreen = fallback
-        warn("[ESP+HITBOX] Fallback do menu criado em PlayerGui.")
+        -- criar UI mínima no fallback para consistência
+        -- not strictly necessary, mas garante referências existam
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(0, 300, 0, 160)
+        frame.Position = UDim2.new(0.5, -150, 0.2, 0)
+        frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
+        frame.BorderSizePixel = 0
+        frame.Parent = fallback
     end
     return menuScreen
 end
 
--- Toggle do menu via tecla K
+-- Keybinds: K para menu, KeybindToggle (RightControl por default) para toggle ESP
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.KeyCode == Enum.KeyCode.K then
-        -- Se menu existir, toggle Enabled; se não, cria
         if menuScreen and menuScreen.Parent then
             menuScreen.Enabled = not menuScreen.Enabled
         else
             ensureMenu()
-            if menuScreen and menuScreen.Parent then
-                menuScreen.Enabled = true
-            end
+            if menuScreen and menuScreen.Parent then menuScreen.Enabled = true end
         end
+    end
+    if input.KeyCode == ESP.KeybindToggle then
+        toggleESP()
     end
 end)
 
--- Garante criação inicial do menu
+-- Create menu and initial setup
 ensureMenu()
 
-print("[ESP+HITBOX] Inicializado. Menu nome:", MENU_NAME, "Use K para mostrar/ocultar o menu. ESP:", tostring(ESP.Enabled), "Hitbox:", tostring(HB.Enabled))
+-- Inicializa entradas e hitboxes para jogadores já presentes
+for _, pl in ipairs(Players:GetPlayers()) do
+    if pl.Character then
+        task.spawn(function()
+            task.wait(0.7)
+            setupPlayerEntry(pl)
+            if HB.Enabled and pl.Character then pcall(ensureHitbox, pl.Character) end
+        end)
+    end
+end
+
+print("[ESP+HITBOX] Inicializado. Menu:", MENU_NAME, "Use K para mostrar/ocultar. ESP:", tostring(ESP.Enabled), "Hitbox:", tostring(HB.Enabled))
+
+-- Helpers expostos (opcional)
+getgenv().__lxz_helpers = {
+    toggleESP = toggleESP,
+    enableESP = enableESP,
+    disableESP = disableESP,
+    toggleHB = toggleHB,
+    enableHB = enableHB,
+    disableHB = disableHB,
+}
